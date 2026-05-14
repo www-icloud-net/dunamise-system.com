@@ -1858,9 +1858,10 @@
     const EXTENDED_COLLECTIONS = ["expenses", "offeringBatches", "families", "reminders", "followups", "testimonies", "eventRegistrations", "eventBudgets", "announcements", "documents", "certificates", "departments", "welfare", "inventory", "activityLogs", "notifications"];
     const CLOUD_SYNC_COLLECTIONS = ["members", "events", "attendance", "donations", "prayers", "care", ...EXTENDED_COLLECTIONS.filter(name => name !== "notifications")];
     const SNAPSHOT_COLLECTIONS = ["members", "events", "attendance", "donations", "prayers", "care", ...EXTENDED_COLLECTIONS];
-    const CLOUD_POLL_INTERVAL_MS = 15000;
+    const CLOUD_POLL_INTERVAL_MS = 5000;
     const CLOUD_PAGE_SIZE = 1000;
-    const CLOUD_UPSERT_BATCH_SIZE = 250;
+    const CLOUD_UPSERT_BATCH_SIZE = 500;
+    const CMS_SESSION_STORAGE_KEY = STORAGE_PREFIX + "backendSession";
 
     let cloudSyncTimer = null;
     let cloudPullTimer = null;
@@ -1967,6 +1968,50 @@
       }];
     }
 
+    function readStoredBackendSession() {
+      try {
+        const raw = sessionStorage.getItem(CMS_SESSION_STORAGE_KEY) || localStorage.getItem(CMS_SESSION_STORAGE_KEY);
+        return raw ? JSON.parse(raw) : null;
+      } catch (error) {
+        console.warn("Stored session could not be read", error);
+        return null;
+      }
+    }
+
+    function persistBackendSession() {
+      if (!state.sessionToken || !state.currentUser) return;
+      const payload = JSON.stringify({
+        token: state.sessionToken,
+        user: state.currentUser,
+        savedAt: new Date().toISOString()
+      });
+      try {
+        sessionStorage.setItem(CMS_SESSION_STORAGE_KEY, payload);
+      } catch (error) {
+        console.warn("Session storage save skipped", error);
+      }
+    }
+
+    function restoreBackendSession() {
+      const stored = readStoredBackendSession();
+      if (!stored?.token || !stored?.user?.username) return false;
+      state.sessionToken = String(stored.token || "");
+      const user = normalizeUserRecord(stored.user);
+      state.currentUser = { id: user.id, displayName: user.displayName, username: user.username, role: user.role };
+      state.users = [user];
+      markSetupComplete();
+      return true;
+    }
+
+    function clearStoredBackendSession() {
+      try {
+        sessionStorage.removeItem(CMS_SESSION_STORAGE_KEY);
+        localStorage.removeItem(CMS_SESSION_STORAGE_KEY);
+      } catch (error) {
+        console.warn("Session storage clear skipped", error);
+      }
+    }
+
     function loadState() {
       migrateLegacyStorageOnce();
       state.settings = enforcePermanentChurchIdentity({ ...CHURCH_CONFIG });
@@ -1979,6 +2024,8 @@
       state.care = [];
       EXTENDED_COLLECTIONS.forEach(collection => { state[collection] = []; });
       state.currentUser = null;
+      state.sessionToken = "";
+      restoreBackendSession();
       refreshDailyVerseOfTheDay({ persist: false });
       getCloudClientId();
       initSupabaseClient();
@@ -2331,7 +2378,7 @@
       if (!hasCloudConnection()) return;
       if (!state.cloudReady && !allowSeedBeforeReady) return;
       clearTimeout(cloudSyncTimer);
-      cloudSyncTimer = setTimeout(() => { flushCloudSync(pendingCloudSyncReason || "queued-user-change"); }, 900);
+      cloudSyncTimer = setTimeout(() => { flushCloudSync(pendingCloudSyncReason || "queued-user-change"); }, 250);
     }
 
     async function flushCloudSync(reason = "flush-pending-sync", options = {}) {
@@ -2357,7 +2404,7 @@
       clearTimeout(cloudPullTimer);
       cloudPullTimer = setTimeout(() => {
         pullFromSupabase({ confirmFirst: false, showMessage: false, force: true, source: reason });
-      }, reason === "realtime" ? 1200 : 100);
+      }, reason === "realtime" ? 150 : 50);
     }
 
     function startSharedCloudRefresh() {
@@ -3595,6 +3642,7 @@
       }
       state.currentUser = null;
       state.sessionToken = "";
+      clearStoredBackendSession();
       initSupabaseClient();
       closeSidebar();
       requireAuth();
@@ -3844,6 +3892,7 @@
     function setBackendSessionToken(token) {
       state.sessionToken = String(token || "");
       initSupabaseClient();
+      persistBackendSession();
     }
 
     async function getAuthSessionUser() {
@@ -4065,6 +4114,22 @@
         const churchResult = await state.supabaseClient.from("churches").select("*").eq("singleton_key", true).maybeSingle();
         if (churchResult.error) throw churchResult.error;
         if (churchResult.data) applyCloudChurchSettings(churchResult.data);
+
+        if (state.currentUser && state.sessionToken) {
+          const pulled = await pullFromSupabase({ confirmFirst: false, showMessage: false, force: true, source: "startup-session-restore" });
+          if (pulled) {
+            persistBackendSession();
+            startSharedCloudRefresh();
+            startRealtimeCloudSync();
+            return true;
+          }
+
+          state.currentUser = null;
+          state.sessionToken = "";
+          clearStoredBackendSession();
+          initSupabaseClient();
+        }
+
         state.cloudReady = true;
         state.syncStatus = "ready";
         return true;
@@ -4109,6 +4174,7 @@
         const profile = mapCloudRowToUser(loginRow);
         state.currentUser = { id: profile.id, displayName: profile.displayName, username: profile.username, role: profile.role };
         state.users = [profile];
+        persistBackendSession();
         markSetupComplete();
         await pullFromSupabase({ confirmFirst: false, showMessage: false, force: true, source: "login" });
         requireAuth();
