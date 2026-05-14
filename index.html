@@ -1682,8 +1682,8 @@
       accentColor: "#c9a84c",
       headerThemeColor: "#f9f6f0",
       footerThemeColor: "#152a45",
-      supabaseUrl: "https://iaobyldctlkjgvwdrpao.supabase.co",
-      supabaseAnonKey: "sb_publishable_bm1waVDX9zNpg-jZ8ny9lQ_2n7cQv0V"
+      supabaseUrl: "https://gipvrjhvgvyqhpedvfyf.supabase.co",
+      supabaseAnonKey: "sb_publishable_C-B2C0drdePvYOzBGI2AMw_vpocHkQ4"
     };
 
     const STORAGE_PREFIX = "landOfDunamisChapelFreshSetup.";
@@ -1861,11 +1861,15 @@
     const CLOUD_SYNC_COLLECTIONS = ["members", "events", "attendance", "donations", "prayers", "care", ...EXTENDED_COLLECTIONS.filter(name => name !== "notifications")];
     const SNAPSHOT_COLLECTIONS = ["members", "events", "attendance", "donations", "prayers", "care", ...EXTENDED_COLLECTIONS];
     const CLOUD_POLL_INTERVAL_MS = 15000;
+    const CLOUD_PAGE_SIZE = 1000;
+    const CLOUD_UPSERT_BATCH_SIZE = 250;
 
     let cloudSyncTimer = null;
     let cloudPullTimer = null;
     let cloudRefreshTimer = null;
     let realtimeChannel = null;
+    let cloudSyncInFlight = null;
+    let pendingCloudSyncReason = "";
     let pendingLoginBackgroundDataUrl = null;
     let pendingLoginBackgroundZoom = null;
     let pendingCertificateSignatureScale = null;
@@ -2260,6 +2264,42 @@
       return Number(count || 0);
     }
 
+    function chunkCloudRows(rows, size = CLOUD_UPSERT_BATCH_SIZE) {
+      const list = Array.isArray(rows) ? rows : [];
+      const chunks = [];
+      for (let index = 0; index < list.length; index += size) chunks.push(list.slice(index, index + size));
+      return chunks;
+    }
+
+    async function fetchAllSupabaseRows(tableName, options = {}) {
+      const { select = "*", orderBy = "created_at", ascending = false, pageSize = CLOUD_PAGE_SIZE, filter } = options;
+      const rows = [];
+      let from = 0;
+
+      while (true) {
+        let query = state.supabaseClient.from(tableName).select(select);
+        if (typeof filter === "function") query = filter(query);
+        if (orderBy) query = query.order(orderBy, { ascending });
+
+        const { data, error } = await query.range(from, from + pageSize - 1);
+        if (error) throw error;
+
+        const page = Array.isArray(data) ? data : [];
+        rows.push(...page);
+        if (page.length < pageSize) return rows;
+        from += pageSize;
+      }
+    }
+
+    async function upsertSupabaseRowsInBatches(tableName, rows, options = {}) {
+      const validRows = (Array.isArray(rows) ? rows : []).filter(Boolean);
+      for (const batch of chunkCloudRows(validRows)) {
+        const { error } = await state.supabaseClient.from(tableName).upsert(batch, options);
+        if (error) throw error;
+      }
+      return validRows.length;
+    }
+
     async function getCloudSystemSnapshot() {
       const snapshot = { church: null, dataRows: 0, customUsers: false, hasMeaningfulCloudData: false };
       if (!hasCloudConnection()) return snapshot;
@@ -2268,20 +2308,39 @@
       snapshot.church = churchResult.data || null;
       const mappings = cloudMappings();
       for (const config of Object.values(mappings)) snapshot.dataRows += await countCloudRows(config.table);
-      const usersResult = await state.supabaseClient.from(CLOUD_USERS_TABLE).select("username, password_text, role, is_active");
-      if (!usersResult.error) {
-        snapshot.customUsers = (usersResult.data || []).some(user => user.username !== "admin" || user.password_text !== "admin12345" || user.role !== "admin" || user.is_active === false);
+      try {
+        const users = await fetchAllSupabaseRows(CLOUD_USERS_TABLE, { select: "username, password_text, role, is_active", orderBy: "created_at", ascending: true });
+        snapshot.customUsers = users.some(user => user.username !== "admin" || user.password_text !== "admin12345" || user.role !== "admin" || user.is_active === false);
+      } catch (error) {
+        console.warn("Cloud user count skipped", error);
       }
       snapshot.hasMeaningfulCloudData = Boolean(cloudChurchHasCustomSettings(snapshot.church) || snapshot.dataRows > 0 || snapshot.customUsers);
       return snapshot;
     }
 
-    function queueCloudSync() {
+    function queueCloudSync(reason = "queued-user-change") {
+      const allowSeedBeforeReady = state.syncStatus === "seeding";
       state.syncStatus = hasCloudConnection() ? "pending" : "offline";
+      pendingCloudSyncReason = reason || pendingCloudSyncReason || "queued-user-change";
       if (!hasCloudConnection()) return;
-      if (!state.cloudReady && state.syncStatus !== "seeding") return;
+      if (!state.cloudReady && !allowSeedBeforeReady) return;
       clearTimeout(cloudSyncTimer);
-      cloudSyncTimer = setTimeout(() => { syncAllToSupabase(false, "queued-admin-change"); }, 900);
+      cloudSyncTimer = setTimeout(() => { flushCloudSync(pendingCloudSyncReason || "queued-user-change"); }, 900);
+    }
+
+    async function flushCloudSync(reason = "flush-pending-sync", options = {}) {
+      if (cloudSyncTimer) {
+        clearTimeout(cloudSyncTimer);
+        cloudSyncTimer = null;
+      }
+      if (cloudSyncInFlight) return cloudSyncInFlight;
+      if (!hasCloudConnection() || !state.currentUser) return false;
+
+      const syncReason = reason || pendingCloudSyncReason || "flush-pending-sync";
+      pendingCloudSyncReason = "";
+      cloudSyncInFlight = syncAllToSupabase(Boolean(options.showMessage), syncReason)
+        .finally(() => { cloudSyncInFlight = null; });
+      return cloudSyncInFlight;
     }
 
     function scheduleSilentCloudPull(reason = "scheduled") {
@@ -2431,8 +2490,7 @@
         return row;
       }).filter(row => row.client_ref);
       if (!rows.length) return;
-      const { error } = await state.supabaseClient.from(config.table).upsert(rows, { onConflict: "church_id,client_ref" });
-      if (error) throw error;
+      await upsertSupabaseRowsInBatches(config.table, rows, { onConflict: "church_id,client_ref" });
     }
 
     async function deleteCollectionRecordFromSupabase(collectionName, id) {
@@ -3512,13 +3570,37 @@
       }
     }
 
+    async function handleLogout() {
+      const hasPendingCloudSave = Boolean(cloudSyncTimer || state.syncStatus === "pending");
+      if (hasPendingCloudSave && state.currentUser) {
+        showToast("Saving pending records to Supabase before logout...");
+        const saved = await flushCloudSync("logout-flush");
+        if (!saved && !confirm("Some recent changes did not save to Supabase. Logout anyway?")) {
+          state.syncStatus = hasCloudConnection() ? "failed" : "offline";
+          renderAll();
+          return;
+        }
+      }
+
+      try {
+        await state.supabaseClient?.auth?.signOut();
+      } catch (error) {
+        console.warn("Supabase sign out skipped", error);
+      }
+      state.currentUser = null;
+      closeSidebar();
+      requireAuth();
+      renderAll();
+      showToast("Logged out.");
+    }
+
     function bindEventListeners() {
       $("#hamburgerBtn").addEventListener("click", () => { $("#sidebar").classList.contains("open") ? closeSidebar() : openSidebar(); });
       $("#sidebarBackdrop").addEventListener("click", closeSidebar);
       $("#modalCloseBtn").addEventListener("click", closeModal);
       $("#modalBackdrop").addEventListener("click", event => { if (event.target.id === "modalBackdrop") closeModal(); });
       $("#openSetupBtn")?.addEventListener("click", () => openModal("First Time Setup", setupWizardHtml()));
-      $("#logoutBtn").addEventListener("click", async () => { try { await state.supabaseClient?.auth?.signOut(); } catch (error) { console.warn("Supabase sign out skipped", error); } state.currentUser = null; closeSidebar(); requireAuth(); showToast("Logged out."); });
+      $("#logoutBtn").addEventListener("click", handleLogout);
       $("#sidebarNav").addEventListener("click", event => { const button = event.target.closest(".nav-link"); if (button) setActiveSection(button.dataset.section); });
       $("#memberSearch").addEventListener("input", renderMembers);
       $("#purposeFilter").addEventListener("change", renderDonations);
@@ -3733,9 +3815,10 @@
         try {
           state.supabaseClient = window.supabase.createClient(state.settings.supabaseUrl, state.settings.supabaseAnonKey, {
             auth: {
-              persistSession: false,
-              autoRefreshToken: false,
-              detectSessionInUrl: false
+              persistSession: true,
+              autoRefreshToken: true,
+              detectSessionInUrl: true,
+              storageKey: STORAGE_PREFIX + "supabaseAuthSession"
             }
           });
         } catch (error) {
@@ -3774,11 +3857,7 @@
     async function pullUsersFromSupabase(options = {}) {
       const { showMessage = false } = options;
       if (!hasCloudConnection()) return false;
-      const { data, error } = await state.supabaseClient
-        .from(AUTH_PROFILE_TABLE)
-        .select("*")
-        .order("created_at", { ascending: true });
-      if (error) throw error;
+      const data = await fetchAllSupabaseRows(AUTH_PROFILE_TABLE, { orderBy: "created_at", ascending: true });
       state.users = (data || []).map(mapCloudRowToUser).filter(user => user.username);
       syncCurrentUserAfterUserPull();
       if (showMessage) showToast("Approved Supabase Auth profiles loaded.");
@@ -3789,8 +3868,7 @@
       if (!hasCloudConnection() || !isAdminUser()) return false;
       const rows = state.users.map(mapUserToCloudRow).filter(row => row.username);
       if (!rows.length) return false;
-      const { error } = await state.supabaseClient.from(AUTH_PROFILE_TABLE).upsert(rows, { onConflict: "username" });
-      if (error) throw error;
+      await upsertSupabaseRowsInBatches(AUTH_PROFILE_TABLE, rows, { onConflict: "username" });
       return true;
     }
 
@@ -3809,7 +3887,16 @@
     async function saveCloudSnapshot(reason = "sync") {
       if (!hasCloudConnection() || !isAdminUser()) return true;
       try {
-        const payload = buildCloudSnapshotPayload(reason);
+        const payload = {
+          schemaVersion: 3,
+          system: "Land of Dunamis Chapel Church Management System",
+          reason,
+          updatedAt: new Date().toISOString(),
+          updatedBy: state.currentUser?.username || state.currentUser?.displayName || "system",
+          clientId: getCloudClientId(),
+          settings: enforcePermanentChurchIdentity({ ...state.settings }),
+          recordCounts: Object.fromEntries(SNAPSHOT_COLLECTIONS.map(collection => [collection, Array.isArray(state[collection]) ? state[collection].length : 0]))
+        };
         const row = {
           snapshot_key: CLOUD_SNAPSHOT_KEY,
           payload,
@@ -3879,8 +3966,7 @@
         return row;
       }).filter(row => row.client_ref);
       if (!rows.length) return;
-      const { error } = await state.supabaseClient.from(config.table).upsert(rows, { onConflict: "church_id,client_ref" });
-      if (error) throw error;
+      await upsertSupabaseRowsInBatches(config.table, rows, { onConflict: "church_id,client_ref" });
     }
 
     async function deleteCollectionRecordFromSupabase(collectionName, id) {
@@ -3939,8 +4025,7 @@
         const mappings = cloudMappings();
         for (const [collectionName, config] of Object.entries(mappings)) {
           try {
-            const { data, error } = await state.supabaseClient.from(config.table).select("*").order("created_at", { ascending: false });
-            if (error) throw error;
+            const data = await fetchAllSupabaseRows(config.table, { orderBy: "created_at", ascending: false });
             state[collectionName] = (data || []).map(config.from);
           } catch (error) {
             console.warn(`Supabase pull skipped ${collectionName}`, error);
