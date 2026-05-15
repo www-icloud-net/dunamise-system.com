@@ -2059,7 +2059,9 @@
       state.settings = enforcePermanentChurchIdentity({ ...CHURCH_CONFIG, ...(payload.settings || {}) });
       state.users = Array.isArray(payload.users) && payload.users.length ? payload.users : defaultUsers();
       SNAPSHOT_COLLECTIONS.forEach(collection => {
-        state[collection] = Array.isArray(payload[collection]) ? payload[collection] : [];
+        const records = Array.isArray(payload[collection]) ? payload[collection] : [];
+        if (records.length) mergeCloudRecordsIntoCollection(collection, records);
+        else if (!Array.isArray(state[collection])) state[collection] = [];
       });
       // Supabase snapshot has become the in-memory source for this session.
       syncCurrentUserAfterUserPull();
@@ -2161,6 +2163,65 @@
     function nullIfEmpty(value) {
       const text = String(value ?? "").trim();
       return text ? text : null;
+    }
+
+    function collectionRecordPrefix(collectionName) {
+      return String(collectionName || "rec").replace(/[^a-z0-9]/gi, "").slice(0, 4).toLowerCase() || "rec";
+    }
+
+    function ensureCollectionRecordIds(collectionName) {
+      const records = Array.isArray(state[collectionName]) ? state[collectionName] : [];
+      const seen = new Set();
+      let changed = false;
+      state[collectionName] = records.map(record => {
+        const safeRecord = record && typeof record === "object" ? record : {};
+        let id = String(safeRecord.id || "").trim();
+        if (!id || seen.has(id)) {
+          id = uid(collectionRecordPrefix(collectionName));
+          changed = true;
+        }
+        seen.add(id);
+        return id === safeRecord.id ? safeRecord : { ...safeRecord, id };
+      });
+      return changed;
+    }
+
+    function recordSortValue(record) {
+      const candidates = [
+        record?.updatedAt,
+        record?.createdAt,
+        record?.recordedAt,
+        record?.date,
+        record?.eventDate,
+        record?.attendanceDate,
+        record?.submittedAt,
+        record?.careDate
+      ];
+      for (const value of candidates) {
+        const time = Date.parse(value || "");
+        if (!Number.isNaN(time)) return time;
+      }
+      return 0;
+    }
+
+    function mergeCloudRecordsIntoCollection(collectionName, cloudRecords = []) {
+      const existing = Array.isArray(state[collectionName]) ? state[collectionName] : [];
+      const merged = new Map();
+      existing.forEach(record => {
+        if (!record || typeof record !== "object") return;
+        const id = String(record.id || "").trim();
+        if (id) merged.set(id, record);
+      });
+      cloudRecords.forEach(record => {
+        if (!record || typeof record !== "object") return;
+        const id = String(record.id || "").trim();
+        if (!id) return;
+        const local = merged.get(id);
+        merged.set(id, local ? { ...local, ...record } : record);
+      });
+      const records = Array.from(merged.values()).sort((a, b) => recordSortValue(b) - recordSortValue(a));
+      state[collectionName] = records;
+      return records;
     }
 
     function isMissingCloudUsersTableError(error) {
@@ -2392,7 +2453,13 @@
       const syncReason = reason || pendingCloudSyncReason || "flush-pending-sync";
       pendingCloudSyncReason = "";
       cloudSyncInFlight = syncAllToSupabase(Boolean(options.showMessage), syncReason)
-        .finally(() => { cloudSyncInFlight = null; });
+        .finally(() => {
+          cloudSyncInFlight = null;
+          if (pendingCloudSyncReason && hasCloudConnection() && state.currentUser) {
+            clearTimeout(cloudSyncTimer);
+            cloudSyncTimer = setTimeout(() => flushCloudSync(pendingCloudSyncReason || "queued-user-change"), 50);
+          }
+        });
       return cloudSyncInFlight;
     }
 
@@ -2537,6 +2604,7 @@
       const mappings = cloudMappings();
       const config = mappings[collectionName];
       if (!config) return;
+      ensureCollectionRecordIds(collectionName);
       const rows = (state[collectionName] || []).map(record => {
         const row = config.map(record) || {};
         if (!row.payload) row.payload = record;
@@ -2614,7 +2682,8 @@
         for (const [collectionName, config] of Object.entries(mappings)) {
           const { data, error } = await state.supabaseClient.from(config.table).select("*").order("created_at", { ascending: false });
           if (error) { console.warn(`Supabase pull skipped ${collectionName}`, error); continue; }
-          state[collectionName] = (data || []).map(config.from);
+          const records = (data || []).map(config.from).filter(record => record?.id);
+          mergeCloudRecordsIntoCollection(collectionName, records);
         }
         state.settings = enforcePermanentChurchIdentity(state.settings);
         state.cloudReady = true;
@@ -4013,6 +4082,7 @@
       const mappings = cloudMappings();
       const config = mappings[collectionName];
       if (!config) return;
+      ensureCollectionRecordIds(collectionName);
       const rows = (state[collectionName] || []).map(record => {
         const row = config.map(record) || {};
         if (!row.payload) row.payload = record;
@@ -4083,7 +4153,8 @@
         for (const [collectionName, config] of Object.entries(mappings)) {
           try {
             const data = await fetchAllSupabaseRows(config.table, { orderBy: "created_at", ascending: false });
-            state[collectionName] = (data || []).map(config.from);
+            const records = (data || []).map(config.from).filter(record => record?.id);
+            mergeCloudRecordsIntoCollection(collectionName, records);
           } catch (error) {
             console.warn(`Supabase pull skipped ${collectionName}`, error);
           }
