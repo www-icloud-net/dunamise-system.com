@@ -1862,6 +1862,7 @@
     const CLOUD_PAGE_SIZE = 1000;
     const CLOUD_UPSERT_BATCH_SIZE = 500;
     const CMS_SESSION_STORAGE_KEY = STORAGE_PREFIX + "backendSession";
+    const LOCAL_RECORD_RECOVERY_KEY = STORAGE_PREFIX + "pendingRecordRecovery";
 
     let cloudSyncTimer = null;
     let cloudPullTimer = null;
@@ -1883,7 +1884,10 @@
     const formatCurrency = amount => new Intl.NumberFormat(state.settings.locale || "en-GH", { style: "currency", currency: state.settings.currency || "GHS", minimumFractionDigits: 2 }).format(Number(amount) || 0);
     const escapeHtml = value => String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
     const escapeAttribute = escapeHtml;
-    const save = () => true;
+    const save = (key, value) => {
+      persistLocalRecordRecoveryByKey(key, value);
+      return true;
+    };
     const read = (key, fallback) => fallback;
 
     function getCloudClientId() {
@@ -2012,6 +2016,73 @@
       }
     }
 
+    function readLocalRecordRecoverySnapshot() {
+      try {
+        const raw = localStorage.getItem(LOCAL_RECORD_RECOVERY_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === "object" ? parsed : null;
+      } catch (error) {
+        console.warn("Local pending record recovery read skipped", error);
+        return null;
+      }
+    }
+
+    function storageKeyToCollectionName(key) {
+      const entry = Object.entries(STORAGE_KEYS).find(([, storageKey]) => storageKey === key);
+      return entry?.[0] || "";
+    }
+
+    function persistLocalRecordRecoveryByKey(key, value) {
+      const collectionName = storageKeyToCollectionName(key);
+      if (!collectionName || !CLOUD_SYNC_COLLECTIONS.includes(collectionName) || !Array.isArray(value)) return true;
+      try {
+        const snapshot = readLocalRecordRecoverySnapshot() || { schemaVersion: 1, collections: {} };
+        snapshot.schemaVersion = 1;
+        snapshot.updatedAt = new Date().toISOString();
+        snapshot.reason = "local-record-change-before-cloud-confirmation";
+        snapshot.collections = snapshot.collections && typeof snapshot.collections === "object" ? snapshot.collections : {};
+        snapshot.collections[collectionName] = value;
+        localStorage.setItem(LOCAL_RECORD_RECOVERY_KEY, JSON.stringify(snapshot));
+        state.localRecoveryPending = true;
+        return true;
+      } catch (error) {
+        console.warn("Local pending record recovery save skipped", error);
+        return false;
+      }
+    }
+
+    function hasLocalRecordRecoverySnapshot() {
+      const snapshot = readLocalRecordRecoverySnapshot();
+      return Boolean(snapshot?.collections && Object.values(snapshot.collections).some(records => Array.isArray(records) && records.length));
+    }
+
+    function restoreLocalRecordRecoverySnapshot() {
+      const snapshot = readLocalRecordRecoverySnapshot();
+      if (!snapshot?.collections || typeof snapshot.collections !== "object") return false;
+      let restored = false;
+      Object.entries(snapshot.collections).forEach(([collectionName, records]) => {
+        if (!CLOUD_SYNC_COLLECTIONS.includes(collectionName) || !Array.isArray(records) || !records.length) return;
+        const safeRecords = records
+          .filter(record => record && typeof record === "object")
+          .map(record => String(record.id || "").trim() ? record : { ...record, id: uid(collectionRecordPrefix(collectionName)) });
+        if (!safeRecords.length) return;
+        mergeCloudRecordsIntoCollection(collectionName, safeRecords);
+        restored = true;
+      });
+      state.localRecoveryPending = restored;
+      return restored;
+    }
+
+    function clearLocalRecordRecoverySnapshot() {
+      try {
+        localStorage.removeItem(LOCAL_RECORD_RECOVERY_KEY);
+        state.localRecoveryPending = false;
+      } catch (error) {
+        console.warn("Local pending record recovery clear skipped", error);
+      }
+    }
+
     function loadState() {
       migrateLegacyStorageOnce();
       state.settings = enforcePermanentChurchIdentity({ ...CHURCH_CONFIG });
@@ -2026,6 +2097,7 @@
       state.currentUser = null;
       state.sessionToken = "";
       restoreBackendSession();
+      restoreLocalRecordRecoverySnapshot();
       refreshDailyVerseOfTheDay({ persist: false });
       getCloudClientId();
       initSupabaseClient();
@@ -2637,6 +2709,7 @@
         state.cloudReady = true;
         state.syncStatus = "synced";
         state.lastSyncAt = new Date().toISOString();
+        if (!pendingCloudSyncReason) clearLocalRecordRecoverySnapshot();
         if (showMessage) showToast("Saved to shared cloud. Other laptops and phones will load the same records.");
         return true;
       } catch (error) {
@@ -2740,6 +2813,7 @@
         if (pulled) {
           startSharedCloudRefresh();
           startRealtimeCloudSync();
+          if (hasLocalRecordRecoverySnapshot()) flushCloudSync("startup-local-record-recovery");
           return true;
         }
 
@@ -4119,6 +4193,7 @@
         state.cloudReady = true;
         state.syncStatus = "synced";
         state.lastSyncAt = new Date().toISOString();
+        if (!pendingCloudSyncReason) clearLocalRecordRecoverySnapshot();
         if (showMessage) showToast("Saved securely to Supabase with RLS enforcement.");
         return true;
       } catch (error) {
@@ -4192,6 +4267,7 @@
             persistBackendSession();
             startSharedCloudRefresh();
             startRealtimeCloudSync();
+            if (hasLocalRecordRecoverySnapshot()) flushCloudSync("startup-local-record-recovery");
             return true;
           }
 
